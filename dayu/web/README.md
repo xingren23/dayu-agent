@@ -20,22 +20,6 @@
 统一约束：
 
 - 两条入口都遵循 `UI -> Service -> Host -> Agent`，不允许 UI 直接绕过 `Service` 调 `Host` 内部细节。
-- Streamlit UI 通过 `dayu.services.web_service_preparation.prepare_web_services()` 装配全部 Service 协议，UI 层不直接 import 具体 Service 实现类。
 - `streamlit_app.py` 可以维护 UI 会话状态，但不扩展成通用 API 网关。
 - `fastapi_app.py` 负责稳定 API 契约，但不承载 Streamlit 页面行为或页面状态。
 - 同一业务能力优先复用同一组 `ServiceProtocol`，保证 CLI / Streamlit / FastAPI 语义一致。
-
-## 2. Streamlit Web 当前功能
-
-- **自选股管理**（已实现）：添加、删除、编辑自选股，数据持久化至 `workspace/.dayu/streamlit/watchlist.json`
-- **页面骨架**（已实现）：侧边栏自选股导航 + 三个功能 Tab（财报管理 / 交互式分析 / 分析报告）
-- 财报管理 Tab（占位）：后续接入 `FinsServiceProtocol` 提供财报下载与管理
-- 交互式分析 Tab（占位）：后续接入 `ChatServiceProtocol` 提供多轮对话
-- 分析报告 Tab（占位）：后续接入 `WriteServiceProtocol` 提供报告生成与展示
-
-## 3. Service 装配
-
-Streamlit UI 的 Service 装配统一由 `dayu.services.web_service_preparation.prepare_web_services()` 完成。
-该函数返回 `WebServices` dataclass，包含所有 Service 协议实例（`FinsServiceProtocol`、`WriteServiceProtocol`、`ChatServiceProtocol`、`HostAdminServiceProtocol`、`ReplyDeliveryServiceProtocol`）。
-
-工作区路径通过环境变量 `DAYU_WORKSPACE` 指定，默认为当前目录下的 `workspace/`。
