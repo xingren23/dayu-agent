@@ -70,10 +70,10 @@ def _prepare_host_runtime() -> PreparedHostRuntimeDependencies | None:
         无。
 
     返回值:
-        成功时返回 ``PreparedHostRuntimeDependencies`` 实例；失败时返回 None。
+        ``PreparedHostRuntimeDependencies`` 实例。
 
     异常:
-        不抛出异常。内部异常会转换为 UI warning。
+        内部异常直接向上抛出，由调用方（``main()``）统一捕获并转为 UI warning。
     """
 
     workspace_root = _resolve_workspace_root()
