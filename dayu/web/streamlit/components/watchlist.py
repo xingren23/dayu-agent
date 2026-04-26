@@ -7,15 +7,12 @@
 from __future__ import annotations
 
 import json
-import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-
-_logger = logging.getLogger(__name__)
 
 
 

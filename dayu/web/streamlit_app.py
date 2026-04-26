@@ -28,11 +28,8 @@ from typing import TYPE_CHECKING
 
 import streamlit as st
 
-from dayu.log import Log
-
 if TYPE_CHECKING:
-    from dayu.services.web_service_preparation import WebServices
-    from dayu.web.streamlit.components.watchlist import WatchlistItem
+    from dayu.services.startup_preparation import PreparedHostRuntimeDependencies
 
 MODULE = "WEB.STREAMLIT.APP"
 
@@ -63,33 +60,37 @@ def _resolve_workspace_root() -> Path:
     return (Path.cwd() / "workspace").resolve()
 
 
-def _initialize_services() -> WebServices | None:
-    """初始化 Streamlit 页面所需 Service 依赖。
+def _prepare_host_runtime() -> PreparedHostRuntimeDependencies | None:
+    """准备 Streamlit 页面所需的 Host 运行时依赖。
 
-    调用 Service 层组合根 ``prepare_web_services()`` 完成全部 Service 装配，
-    UI 层不直接 import 或实例化任何具体 Service 类。
+    调用 Service 层 ``prepare_host_runtime_dependencies()`` 完成 Host 运行时装配，
+    各 Tab 按需从返回的依赖中构造自己的 Service。
 
     参数:
         无。
 
     返回值:
-        成功时返回 ``WebServices`` 实例；失败时返回 None 并通过 st.warning 展示错误。
+        成功时返回 ``PreparedHostRuntimeDependencies`` 实例；失败时返回 None。
 
     异常:
         不抛出异常。内部异常会转换为 UI warning。
     """
 
     workspace_root = _resolve_workspace_root()
+
+    from dayu.log import Log
+
     Log.info(f"工作区根目录: {workspace_root}", module=MODULE)
 
-    from dayu.services.web_service_preparation import prepare_web_services
+    from dayu.services.startup_preparation import prepare_host_runtime_dependencies
 
-    result = prepare_web_services(workspace_root=workspace_root)
-
-    for warning in result.warnings:
-        st.warning(warning)
-
-    return result.services
+    return prepare_host_runtime_dependencies(
+        workspace_root=workspace_root,
+        config_root=None,
+        execution_options=None,
+        runtime_label="Web Host runtime",
+        log_module=MODULE,
+    )
 
 
 def _configure_streamlit_page() -> None:
@@ -108,7 +109,7 @@ def _ensure_session_state_initialized() -> None:
 
     if "initialized" not in st.session_state:
         st.session_state["initialized"] = False
-        st.session_state["web_services"] = None
+        st.session_state["prepared_deps"] = None
 
 
 def main() -> None:
@@ -120,19 +121,19 @@ def main() -> None:
     _configure_streamlit_page()
     _ensure_session_state_initialized()
 
-    web_services: WebServices | None = st.session_state["web_services"]
+    prepared_deps: PreparedHostRuntimeDependencies | None = st.session_state["prepared_deps"]
 
-    # 初始化服务（只执行一次）
+    # 准备 Host 运行时依赖（只执行一次）
     if not bool(st.session_state["initialized"]):
         try:
-            web_services = _initialize_services()
-            st.session_state["web_services"] = web_services
+            prepared_deps = _prepare_host_runtime()
+            st.session_state["prepared_deps"] = prepared_deps
             st.session_state["initialized"] = True
         except Exception as exc:
             st.error(f"服务初始化失败: {exc}")
             st.stop()
 
-    workspace_root = web_services.workspace_root if web_services is not None else _resolve_workspace_root()
+    workspace_root = _resolve_workspace_root()
 
     # 左侧边栏：渲染自选股列表
     selected_stock = render_sidebar(workspace_root=workspace_root)
@@ -140,11 +141,11 @@ def main() -> None:
     # 主功能区
     if selected_stock is None:
         render_welcome_page()
-    elif web_services is not None:
+    elif prepared_deps is not None:
         render_stock_detail_page(
             selected_stock=selected_stock,
-            workspace_root=web_services.workspace_root,
-            web_services=web_services,
+            workspace_root=workspace_root,
+            prepared_deps=prepared_deps,
         )
     else:
         st.error("财报服务不可用，无法展示股票详情。请检查配置后刷新页面。")
