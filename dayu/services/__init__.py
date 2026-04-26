@@ -38,6 +38,7 @@ from dayu.services.startup_preparation import (
     prepare_scene_execution_acceptance_preparer,
 )
 from dayu.services.startup_recovery import recover_host_startup_state
+from dayu.services.web_service_preparation import WebServicePreparationResult, WebServices, prepare_web_services
 from dayu.services.write_service import WriteService
 
 __all__ = [
@@ -73,6 +74,9 @@ __all__ = [
     "SceneModelConfig",
     "WriteRequest",
     "WriteRunConfig",
+    "WebServicePreparationResult",
+    "WebServices",
     "WriteService",
     "WriteServiceProtocol",
+    "prepare_web_services",
 ]

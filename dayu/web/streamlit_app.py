@@ -21,18 +21,75 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import streamlit as st
 
-if TYPE_CHECKING:
-    from dayu.services.protocols import FinsServiceProtocol, WriteServiceProtocol
-    from dayu.web.streamlit.components.watchlist import WatchlistItem
-    from dayu.web.streamlit.pages.chat_tab import ChatServiceClient
-from dayu.web.streamlit.bootstrap import initialize_services
+from dayu.log import Log
 
+if TYPE_CHECKING:
+    from dayu.services.web_service_preparation import WebServices
+    from dayu.web.streamlit.components.watchlist import WatchlistItem
+
+MODULE = "WEB.STREAMLIT.APP"
+
+
+def _resolve_workspace_root() -> Path:
+    """解析 Streamlit 运行工作区目录。
+
+    优先级：
+    1. 环境变量 ``DAYU_WORKSPACE``
+    2. 当前目录下的 ``workspace``
+
+    使用环境变量而非命令行参数，避免与 Streamlit 自身的参数解析冲突。
+
+    参数:
+        无。
+
+    返回值:
+        解析后的绝对路径。
+
+    异常:
+        无。
+    """
+
+    env_workspace = os.environ.get("DAYU_WORKSPACE")
+    if env_workspace:
+        return Path(env_workspace).resolve()
+
+    return (Path.cwd() / "workspace").resolve()
+
+
+def _initialize_services() -> WebServices | None:
+    """初始化 Streamlit 页面所需 Service 依赖。
+
+    调用 Service 层组合根 ``prepare_web_services()`` 完成全部 Service 装配，
+    UI 层不直接 import 或实例化任何具体 Service 类。
+
+    参数:
+        无。
+
+    返回值:
+        成功时返回 ``WebServices`` 实例；失败时返回 None 并通过 st.warning 展示错误。
+
+    异常:
+        不抛出异常。内部异常会转换为 UI warning。
+    """
+
+    workspace_root = _resolve_workspace_root()
+    Log.info(f"工作区根目录: {workspace_root}", module=MODULE)
+
+    from dayu.services.web_service_preparation import prepare_web_services
+
+    result = prepare_web_services(workspace_root=workspace_root)
+
+    for warning in result.warnings:
+        st.warning(warning)
+
+    return result.services
 
 
 def _configure_streamlit_page() -> None:
@@ -51,11 +108,7 @@ def _ensure_session_state_initialized() -> None:
 
     if "initialized" not in st.session_state:
         st.session_state["initialized"] = False
-        st.session_state["workspace_root"] = None
-        st.session_state["fins_service"] = None
-        st.session_state["write_service"] = None
-        st.session_state["chat_service_client"] = None
-        st.session_state["host_admin_service"] = None
+        st.session_state["web_services"] = None
 
 
 def main() -> None:
@@ -67,59 +120,34 @@ def main() -> None:
     _configure_streamlit_page()
     _ensure_session_state_initialized()
 
+    web_services: WebServices | None = st.session_state["web_services"]
+
     # 初始化服务（只执行一次）
     if not bool(st.session_state["initialized"]):
         try:
-            workspace_root, fins_service, write_service, chat_service_client = initialize_services()
-            st.session_state["workspace_root"] = workspace_root
-            st.session_state["fins_service"] = fins_service
-            st.session_state["write_service"] = write_service
-            st.session_state["chat_service_client"] = chat_service_client
+            web_services = _initialize_services()
+            st.session_state["web_services"] = web_services
             st.session_state["initialized"] = True
-        except Exception as e:
-            st.error(f"服务初始化失败: {e}")
+        except Exception as exc:
+            st.error(f"服务初始化失败: {exc}")
             st.stop()
 
-    # 从会话状态获取工作区路径和服务
-    workspace_root = st.session_state["workspace_root"]
-    fins_service = st.session_state["fins_service"]
-    write_service = st.session_state["write_service"]
-    chat_service_client = st.session_state["chat_service_client"]
+    workspace_root = web_services.workspace_root if web_services is not None else _resolve_workspace_root()
 
+    # 左侧边栏：渲染自选股列表
+    selected_stock = render_sidebar(workspace_root=workspace_root)
 
-    # 左侧边栏：渲染自选股列表（直接从文件读取）
-    selected_stock = render_sidebar(
-        workspace_root=workspace_root,
-        on_select_callback=_on_stock_selected,
-    )
-
-    # 主功能区（自选股管理对话框由侧边栏「管理」按钮触发）
+    # 主功能区
     if selected_stock is None:
-        # 未选中自选股：展示欢迎页面
         render_welcome_page()
-    elif fins_service is not None:
-        # 选中自选股且服务可用：展示详情页面
+    elif web_services is not None:
         render_stock_detail_page(
             selected_stock=selected_stock,
-            workspace_root=workspace_root,
-            fins_service=fins_service,
-            write_service=write_service,
-            chat_service_client=chat_service_client,
+            workspace_root=web_services.workspace_root,
+            web_services=web_services,
         )
     else:
-        # 选中自选股但服务不可用：提示错误
         st.error("财报服务不可用，无法展示股票详情。请检查配置后刷新页面。")
-
-
-def _on_stock_selected(stock: WatchlistItem) -> None:
-    """自选股选中回调。
-
-    参数:
-        stock: 被选中的自选股。
-    """
-
-    # 可以在这里添加选中后的逻辑
-    pass
 
 
 def run_streamlit() -> int:
@@ -129,25 +157,22 @@ def run_streamlit() -> int:
         无。
 
     返回值:
-        Streamlit 子进程退出码；正常退出通常为 `0`。
+        Streamlit 子进程退出码；正常退出通常为 ``0``。
 
     异常:
-        无。子进程启动失败时由 `subprocess.run` 抛出异常。
+        无。子进程启动失败时由 ``subprocess.run`` 抛出异常。
     """
 
     import subprocess
 
-    # 获取当前文件路径
     app_path = Path(__file__).resolve()
 
-    # 构建 streamlit 命令
     cmd = [
         sys.executable, "-m", "streamlit", "run",
         str(app_path),
-        *sys.argv[1:],  # 传递所有原始参数
+        *sys.argv[1:],
     ]
 
-    # 执行命令
     completed = subprocess.run(cmd, check=False)
     return completed.returncode
 
