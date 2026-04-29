@@ -83,13 +83,34 @@ class _FakeChatService:
         *,
         limit: int = 100,
     ) -> list[SessionTurnExcerptView]:
-        """当前测试默认不返回会话历史。"""
+        """返回指定会话最近轮次。
+
+        Args:
+            session_id: 会话 ID。
+            limit: 返回轮次数上限。
+
+        Returns:
+            空列表，表示当前测试桩不提供历史轮次。
+
+        Raises:
+            无。
+        """
 
         del session_id, limit
         return []
 
     def clear_session(self, session_id: str) -> bool:
-        """当前测试默认允许清空会话。"""
+        """清空指定会话历史。
+
+        Args:
+            session_id: 会话 ID。
+
+        Returns:
+            ``True``，表示清空成功。
+
+        Raises:
+            无。
+        """
 
         del session_id
         return True

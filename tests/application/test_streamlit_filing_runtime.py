@@ -15,7 +15,7 @@ from dayu.web.streamlit.pages.filing.download_progress import (
     DownloadTaskState,
     create_download_task,
 )
-from dayu.web.streamlit.pages.filing.download_panel import DownloadRuntimeState
+from dayu.web.streamlit.pages.filing.download_panel import _DOWNLOAD_WORKER_JOIN_TIMEOUT_SECONDS, DownloadRuntimeState
 
 
 class _FakeSessionState(dict[str, object]):
@@ -149,7 +149,7 @@ def test_poll_download_runtime_events_join_timeout_keeps_runtime(
     panel_module.poll_download_runtime_events()
 
     assert "session-c" in runtime_state
-    assert never_ending_worker.join_timeouts == [0.1]
+    assert never_ending_worker.join_timeouts == [_DOWNLOAD_WORKER_JOIN_TIMEOUT_SECONDS]
     assert task.status == DownloadStatus.RUNNING
 
 
