@@ -20,6 +20,7 @@
 - [host/README.md](host/README.md)
 - [engine/README.md](engine/README.md)
 - [fins/README.md](fins/README.md)
+- [mcp/README.md](mcp/README.md)
 - [config/README.md](config/README.md)
 
 ## 0.1 开发环境安装
@@ -1170,6 +1171,7 @@ sequenceDiagram
 5. `prompting/`
 6. `engine/README.md`
 7. `fins/README.md`
+8. `mcp/README.md`
 
 如果你在扩展时发现某个设计需要让：
 

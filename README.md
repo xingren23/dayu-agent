@@ -18,6 +18,8 @@
 - Host 手册：[dayu/host/README.md](dayu/host/README.md)
 - Engine 手册：[dayu/engine/README.md](dayu/engine/README.md)
 - Fins 手册：[dayu/fins/README.md](dayu/fins/README.md)
+- MCP 手册：[dayu/mcp/README.md](dayu/mcp/README.md)
+
 - 配置手册：[dayu/config/README.md](dayu/config/README.md)
 - 贡献指南：[CONTRIBUTING.md](CONTRIBUTING.md)
 
@@ -387,6 +389,68 @@ dayu-wechat <command> [参数]
 - 同一个 `--label` 对应同一个 `state_dir`；当前实现会对 `state_dir` 加 daemon 单实例锁，避免前台 `run` 和后台 service 或两个前台进程并发运行导致重复补发。
 - `service install/start/stop/status/list/uninstall` 用于以后台服务的形式运行。
 - Windows 目前不支持 `service` 相关命令；在 Windows 上可继续使用 `login` 和 `run`。
+
+### 2.4 MCP 入口
+
+dayu 可通过 MCP 协议（Model Context Protocol）将财报读取工具暴露给
+opencode、codex、claude-code 等外部 Agent 使用。
+当前暴露 9 个财报读取工具，全部基于本地已下载和预处理的财报。
+
+**安装**：
+
+```bash
+pip install dayu-agent[mcp]
+```
+
+**启动**（需先通过 `dayu-cli download` / `dayu-cli process` 完成财报下载和预处理）：
+
+
+**在 opencode 中配置**（`~/.config/opencode/opencode.json`）：
+
+opencode mcp add 将引导你完成配置（命令行）
+
+```bash
+┌  Add MCP server
+│
+◇  Location
+│  Global
+│
+◇  Enter MCP server name
+│  dayu-fins
+│
+◇  Select MCP server type
+│  Local
+│
+■  Enter command to run
+  dayu-mcp --workspace /path/to/workspace
+```
+
+**在 codex 中配置**（命令行）：
+
+```bash
+codex mcp add dayu-fins \
+  --env DAYU_WORKSPACE=/path/to/workspace \
+  -- dayu-mcp --workspace /path/to/workspace
+```
+
+**在 claude-code 中配置**（命令行）：
+
+```bash
+claude mcp add --transport stdio --env DAYU_WORKSPACE=/path/to/workspace dayu-fins \
+  -- dayu-mcp --workspace /path/to/workspace
+```
+
+**当前暴露的工具**（9 个）：
+`list_documents`、`get_document_sections`、`read_section`、`search_document`、
+`list_tables`、`get_table`、`get_page_content`、`get_financial_statement`、
+`query_xbrl_facts`。
+
+环境变量：
+
+| 变量 | 说明 |
+|------|------|
+| `DAYU_WORKSPACE` | 工作区根目录路径（优先级高于 `--workspace`） |
+| `DAYU_LOG_LEVEL` | 日志级别，可选 `DEBUG`/`INFO`/`WARNING`/`ERROR`（默认 `WARNING`） |
 
 ## 3. 最常用工作流
 
@@ -1313,6 +1377,7 @@ dayu-render workspace/draft/AAPL/AAPL_qual_report.md report.html
 - 开发手册总览：[dayu/README.md](dayu/README.md)
 - Engine 包开发手册：[dayu/engine/README.md](dayu/engine/README.md)
 - Fins 包开发手册：[dayu/fins/README.md](dayu/fins/README.md)
+- MCP 包开发手册：[dayu/mcp/README.md](dayu/mcp/README.md)
 - 配置说明手册：[dayu/config/README.md](dayu/config/README.md)
 - 贡献指南：[CONTRIBUTING.md](CONTRIBUTING.md)
 

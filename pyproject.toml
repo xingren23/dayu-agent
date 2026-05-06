@@ -72,6 +72,10 @@ browser = [
 web = [
     "streamlit>=1.49.0,<2.0.0",
 ]
+# MCP Server, 供 opencode/codex/claude-code 等工具远程调用财报能力。
+mcp = [
+    "mcp>=1.20.0",
+]
 # 测试与静态检查工具链。
 test = [
     "pytest>=7.4.0",
@@ -98,6 +102,7 @@ dayu-cli = "dayu.cli.main:main"
 dayu-web = "dayu.web.__main__:main"
 dayu-wechat = "dayu.wechat.main:main"
 dayu-render = "dayu.render.render:main"
+dayu-mcp = "dayu.mcp.server:main"
 
 
 [tool.setuptools.packages.find]
