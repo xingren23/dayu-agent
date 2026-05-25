@@ -33,23 +33,28 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, TypeVar, cast
 
 from dayu.log import Log
+from dayu.pdf_splitter import get_pdf_page_count as _get_pdf_page_count, split_pdf_bytes as _split_pdf_bytes
 
 if TYPE_CHECKING:
     from docling.backend.abstract_backend import AbstractDocumentBackend
     from docling.datamodel.accelerator_options import AcceleratorOptions
     from docling.datamodel.base_models import DocumentStream
     from docling.datamodel.document import ConversionResult
+    from docling_core.types.doc.document import DoclingDocument
     from docling.datamodel.pipeline_options import PipelineOptions, TableFormerMode
     from docling.document_converter import DocumentConverter
 
 DOCLING_DEVICE_ENV = "DAYU_DOCLING_DEVICE"
+DOCLING_CHUNK_SIZE_ENV = "DAYU_DOCLING_CHUNK_SIZE"
 _SUPPORTED_DOCLING_DEVICES = frozenset({"auto", "cpu", "cuda", "mps", "xpu"})
 _AUTO_DEVICE_NAME = "auto"
 _CPU_DEVICE_NAME = "cpu"
@@ -69,6 +74,25 @@ _WINDOWS_PLATFORM_NAME = "win32"
 _TResult = TypeVar("_TResult")
 # Protocol 返回值需要协变，才能让更具体的转换结果回调安全替换更宽的调用点。
 _TResultCovariant = TypeVar("_TResultCovariant", covariant=True)
+
+_DOCLING_CHUNK_PAGE_SIZE_DEFAULT = 40
+_CHUNK_CATEGORY_NAMES = ("texts", "tables", "groups", "pictures")
+
+
+class _DoclingConversionResult(Protocol):
+    """Docling 转换结果最小协议（兼容 ConversionResult 与分片包装）。"""
+
+    @property
+    def document(self) -> "DoclingDocument":
+        ...
+
+
+@dataclass(frozen=True)
+class _ChunkedConversionResult:
+    """分片合并后的转换结果包装。"""
+
+    document: "DoclingDocument"
+
 
 
 class DoclingRuntimeInitializationError(RuntimeError):
@@ -209,6 +233,32 @@ def resolve_docling_device_name() -> str:
         return _normalize_docling_device_name(configured_device)
 
     return _AUTO_DEVICE_NAME
+
+
+def resolve_docling_chunk_size() -> int:
+    """解析 Docling PDF 分片转换的页数阈值。
+
+    通过环境变量 ``DAYU_DOCLING_CHUNK_SIZE`` 配置，默认 40。
+    解析到非法值（非正整数）时静默回退到默认值。
+
+    Args:
+        无。
+
+    Returns:
+        分片页数阈值，始终为正整数。
+
+    Raises:
+        无。
+    """
+    env_value = str(os.environ.get(DOCLING_CHUNK_SIZE_ENV, "") or "").strip()
+    if env_value:
+        try:
+            size = int(env_value)
+            if size > 0:
+                return size
+        except (ValueError, TypeError):
+            pass
+    return _DOCLING_CHUNK_PAGE_SIZE_DEFAULT
 
 
 def _is_windows_platform() -> bool:
@@ -631,6 +681,239 @@ def _build_docling_document_stream(raw_bytes: bytes, *, stream_name: str) -> "Do
     return DocumentStream(name=stream_name, stream=BytesIO(raw_bytes))
 
 
+def _merge_docling_dicts(
+    chunk_dicts: list[dict],
+    page_offsets: list[int],
+) -> dict:
+    """合并多个 Docling export_to_dict() 结果为一个完整文档。
+
+    处理三件事：
+    1. 页码偏移 — 后续 chunk 的 prov[].page_no 和 pages key 累加偏移量。
+    2. self_ref / $ref 全局重编号 — texts/tables/groups/pictures 引用唯一化。
+    3. 数组拼接 — texts/tables/groups/pictures 拼接，body.children 合并。
+
+    Args:
+        chunk_dicts: 各分片的 export_to_dict() 结果列表。
+        page_offsets: 各分片的页码起始偏移量列表，长度与 chunk_dicts 一致。
+
+    Returns:
+        合并后的 Docling 文档字典。
+
+    Raises:
+        ValueError: 输入列表为空时抛出。
+    """
+    if not chunk_dicts:
+        raise ValueError("chunk_dicts 不能为空")
+
+    # 1. 计算各分类的累积长度，用于 ref 全局重编号。
+    cum_text = 0
+    cum_table = 0
+    cum_group = 0
+    cum_picture = 0
+    text_counts: list[int] = []
+    table_counts: list[int] = []
+    group_counts: list[int] = []
+    picture_counts: list[int] = []
+    for chunk in chunk_dicts:
+        tc = len(chunk.get("texts", []))
+        tac = len(chunk.get("tables", []))
+        gc = len(chunk.get("groups", []))
+        pc = len(chunk.get("pictures", []))
+        text_counts.append(tc)
+        table_counts.append(tac)
+        group_counts.append(gc)
+        picture_counts.append(pc)
+
+    # 2. 处理首个 chunk 作为基础。
+    merged: dict = dict(chunk_dicts[0])
+    for cat in ("texts", "tables", "groups", "pictures"):
+        merged.setdefault(cat, [])
+    merged.setdefault("body", {})
+    merged["body"].setdefault("children", [])
+    merged.setdefault("pages", {})
+
+    cum_text += text_counts[0]
+    cum_table += table_counts[0]
+    cum_group += group_counts[0]
+    cum_picture += picture_counts[0]
+
+    # 3. 逐一合并后续 chunk。
+    for i in range(1, len(chunk_dicts)):
+        chunk = chunk_dicts[i]
+        page_offset = page_offsets[i]
+
+        # 构建当前 chunk 的 ref 映射。
+        ref_map: dict[str, str] = {}
+        for idx in range(text_counts[i]):
+            old_ref = f"#/texts/{idx}"
+            new_ref = f"#/texts/{cum_text + idx}"
+            ref_map[old_ref] = new_ref
+        for idx in range(table_counts[i]):
+            old_ref = f"#/tables/{idx}"
+            new_ref = f"#/tables/{cum_table + idx}"
+            ref_map[old_ref] = new_ref
+        for idx in range(group_counts[i]):
+            old_ref = f"#/groups/{idx}"
+            new_ref = f"#/groups/{cum_group + idx}"
+            ref_map[old_ref] = new_ref
+        for idx in range(picture_counts[i]):
+            old_ref = f"#/pictures/{idx}"
+            new_ref = f"#/pictures/{cum_picture + idx}"
+            ref_map[old_ref] = new_ref
+
+        # 应用 ref 映射与页码偏移到当前 chunk。
+        _apply_ref_remap_and_page_offset(chunk, ref_map, page_offset)
+
+        # 拼接数组。
+        merged["texts"].extend(chunk.get("texts", []))
+        merged["tables"].extend(chunk.get("tables", []))
+        merged["groups"].extend(chunk.get("groups", []))
+        merged["pictures"].extend(chunk.get("pictures", []))
+
+        # 合并 body.children。
+        chunk_body_children = chunk.get("body", {}).get("children", [])
+        merged["body"]["children"].extend(chunk_body_children)
+
+        # 合并 pages（偏移 key）。
+        chunk_pages = chunk.get("pages", {})
+        if isinstance(chunk_pages, dict):
+            for page_key, page_val in chunk_pages.items():
+                try:
+                    new_key = str(int(page_key) + page_offset)
+                except (ValueError, TypeError):
+                    new_key = str(page_key)
+                merged["pages"][new_key] = page_val
+
+        cum_text += text_counts[i]
+        cum_table += table_counts[i]
+        cum_group += group_counts[i]
+        cum_picture += picture_counts[i]
+
+    return merged
+
+
+def _apply_ref_remap_and_page_offset(
+    chunk_dict: dict,
+    ref_map: dict[str, str],
+    page_offset: int,
+) -> None:
+    """原地应用 ref 映射与页码偏移到单个 chunk 的 dict。
+
+    修改 chunk_dict 自身：
+    - 各分类数组中 item 的 self_ref 按 ref_map 更新。
+    - prov[].page_no 累加 page_offset。
+    - item 内所有 {"$ref": ...} 值（parent、children、captions、footnotes 等）按 ref_map 递归更新。
+
+    Args:
+        chunk_dict: 单个 chunk 的 export_to_dict() 结果（原地修改）。
+        ref_map: old_ref → new_ref 映射。
+        page_offset: 页码偏移量。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+    # 更新各分类数组的 self_ref 和页码偏移。
+    for cat in _CHUNK_CATEGORY_NAMES:
+        items = chunk_dict.get(cat)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            old_ref = item.get("self_ref")
+            if isinstance(old_ref, str) and old_ref in ref_map:
+                item["self_ref"] = ref_map[old_ref]
+            # 页码偏移
+            if page_offset:
+                prov = item.get("prov")
+                if isinstance(prov, list):
+                    for prov_entry in prov:
+                        if isinstance(prov_entry, dict) and "page_no" in prov_entry:
+                            try:
+                                prov_entry["page_no"] = int(prov_entry["page_no"]) + page_offset
+                            except (TypeError, ValueError):
+                                pass
+            # 递归 remap item 内所有 $ref（parent、children、captions、footnotes、references 等）
+            _remap_nested_refs(item, ref_map)
+
+    # 递归 remap body 内所有 $ref。
+    body = chunk_dict.get("body")
+    if isinstance(body, dict):
+        _remap_nested_refs(body, ref_map)
+
+
+def _remap_nested_refs(obj: object, ref_map: dict[str, str]) -> None:
+    """递归遍历 obj 内所有 dict/list，将匹配的 {\"$ref\": ...} 值按 ref_map 更新。
+
+    覆盖 item 内的 parent、children、captions、footnotes、references、annotations
+    等所有含 $ref 的字段，不依赖枚举特定键名。
+
+    Args:
+        obj: 待遍历的 dict / list / 其他对象（原地修改）。
+        ref_map: old_ref → new_ref 映射。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+    if isinstance(obj, dict):
+        ref_value = obj.get("$ref")
+        if isinstance(ref_value, str) and ref_value in ref_map:
+            obj["$ref"] = ref_map[ref_value]
+        for value in obj.values():
+            _remap_nested_refs(value, ref_map)
+    elif isinstance(obj, list):
+        for item in obj:
+            _remap_nested_refs(item, ref_map)
+
+
+def _build_chunked_result(merged_dict: dict) -> _ChunkedConversionResult:
+    """从合并后的 dict 重建 DoclingDocument 并包装为转换结果。
+
+    优先使用 model_validate 直接构建；失败时回退到临时 JSON 文件加载。
+
+    Args:
+        merged_dict: 合并后的 Docling 文档字典。
+
+    Returns:
+        包装后的分片转换结果。
+
+    Raises:
+        RuntimeError: DoclingDocument 构建失败时抛出。
+    """
+    try:
+        from docling_core.types.doc.document import DoclingDocument
+    except ImportError as exc:  # pragma: no cover - 依赖缺失保护
+        raise DoclingRuntimeInitializationError(
+            "docling-core 未安装，无法重建 DoclingDocument"
+        ) from exc
+
+    try:
+        doc = DoclingDocument.model_validate(merged_dict)
+    except Exception:
+        Log.debug(
+            "model_validate \u5931\u8d25\uff0c\u56de\u9000\u5230\u4e34\u65f6\u6587\u4ef6\u52a0\u8f7d DoclingDocument",
+            module=_MODULE,
+        )
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, encoding="utf-8"
+        ) as tmp:
+            json.dump(merged_dict, tmp, ensure_ascii=False)
+            tmp_path = tmp.name
+        try:
+            doc = DoclingDocument.load_from_json(tmp_path)
+        finally:
+            os.unlink(tmp_path)
+
+    return _ChunkedConversionResult(document=doc)
+
+
+
 def convert_pdf_bytes_with_docling(
     raw_bytes: bytes,
     *,
@@ -639,12 +922,16 @@ def convert_pdf_bytes_with_docling(
     do_table_structure: bool = True,
     table_mode: str = _TABLE_MODE_ACCURATE,
     do_cell_matching: bool = True,
-) -> "ConversionResult":
+) -> _DoclingConversionResult:
     """以字节流形式调用 Docling，规避 Windows 非 ASCII 路径编码问题。
 
     Docling 在 Windows 上把 ``Path`` 输入按 mbcs（cp936）编码后传给
     docling-parse C++ 后端，导致合法文档被判 ``not valid``。本函数把字节流
     封装成 ``DocumentStream`` 直接喂给 Docling，绕开文件系统路径编码层。
+
+    当 PDF 页数超过分片阈值（由环境变量 ``DAYU_DOCLING_CHUNK_SIZE`` 配置，
+    默认 40 页）时，自动拆分为多个分片分别转换，再合并结果，避免大文件
+    单次转换内存溢出。
 
     Args:
         raw_bytes: PDF 原始字节内容。
@@ -662,11 +949,51 @@ def convert_pdf_bytes_with_docling(
         ValueError: ``table_mode`` 非法时抛出。
     """
 
-    stream = _build_docling_document_stream(raw_bytes, stream_name=stream_name)
-    return run_docling_pdf_conversion(
-        lambda converter: converter.convert(stream),
-        do_ocr=do_ocr,
-        do_table_structure=do_table_structure,
-        table_mode=table_mode,
-        do_cell_matching=do_cell_matching,
+    try:
+        page_count = _get_pdf_page_count(raw_bytes)
+    except Exception:
+        page_count = 0
+
+    chunk_size = resolve_docling_chunk_size()
+
+    if page_count <= chunk_size:
+        stream = _build_docling_document_stream(raw_bytes, stream_name=stream_name)
+        return run_docling_pdf_conversion(
+            lambda converter: converter.convert(stream),
+            do_ocr=do_ocr,
+            do_table_structure=do_table_structure,
+            table_mode=table_mode,
+            do_cell_matching=do_cell_matching,
+        )
+
+    Log.info(
+        f"PDF 页数 {page_count} 超过阈值 {chunk_size}，"
+        f"启用分片转换，流名: {stream_name}",
+        module=_MODULE,
     )
+    chunk_bytes_list = _split_pdf_bytes(raw_bytes, chunk_size)
+    chunk_dicts: list[dict] = []
+    page_offsets: list[int] = []
+
+    for chunk_index, chunk_bytes in enumerate(chunk_bytes_list):
+        chunk_stream = _build_docling_document_stream(
+            chunk_bytes, stream_name=stream_name
+        )
+        chunk_result = run_docling_pdf_conversion(
+            lambda converter: converter.convert(chunk_stream),
+            do_ocr=do_ocr,
+            do_table_structure=do_table_structure,
+            table_mode=table_mode,
+            do_cell_matching=do_cell_matching,
+        )
+        chunk_dict = chunk_result.document.export_to_dict()
+        chunk_dicts.append(chunk_dict)
+        page_offsets.append(chunk_index * chunk_size)
+        Log.info(
+            f"Docling 分片转换完成: chunk={chunk_index + 1}/{len(chunk_bytes_list)} "
+            f"流名={stream_name}",
+            module=_MODULE,
+        )
+
+    merged_dict = _merge_docling_dicts(chunk_dicts, page_offsets)
+    return _build_chunked_result(merged_dict)

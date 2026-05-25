@@ -9,9 +9,12 @@ import pytest
 
 from dayu.docling_runtime import (
     DOCLING_DEVICE_ENV,
+    DOCLING_CHUNK_SIZE_ENV,
     DoclingRuntimeInitializationError,
+    _DOCLING_CHUNK_PAGE_SIZE_DEFAULT,
     build_docling_pdf_pipeline_options,
     convert_pdf_bytes_with_docling,
+    resolve_docling_chunk_size,
     resolve_docling_device_name,
     run_docling_pdf_conversion,
 )
@@ -98,6 +101,70 @@ def test_resolve_docling_device_name_rejects_invalid_env_value(
 
     with pytest.raises(RuntimeError, match=DOCLING_DEVICE_ENV):
         resolve_docling_device_name()
+
+
+def test_resolve_docling_chunk_size_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """验证未设置环境变量时返回默认值。
+
+    Args:
+        monkeypatch: pytest 环境变量 monkeypatch 工具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+    monkeypatch.delenv(DOCLING_CHUNK_SIZE_ENV, raising=False)
+    assert resolve_docling_chunk_size() == _DOCLING_CHUNK_PAGE_SIZE_DEFAULT
+
+
+def test_resolve_docling_chunk_size_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """验证环境变量设置时返回配置值。
+
+    Args:
+        monkeypatch: pytest 环境变量 monkeypatch 工具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+    monkeypatch.setenv(DOCLING_CHUNK_SIZE_ENV, "20")
+    assert resolve_docling_chunk_size() == 20
+
+
+def test_resolve_docling_chunk_size_invalid_env_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    """验证非法环境变量值时回退到默认值。
+
+    Args:
+        monkeypatch: pytest 环境变量 monkeypatch 工具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+    monkeypatch.setenv(DOCLING_CHUNK_SIZE_ENV, "not_a_number")
+    assert resolve_docling_chunk_size() == _DOCLING_CHUNK_PAGE_SIZE_DEFAULT
+
+
+def test_resolve_docling_chunk_size_zero_env_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    """验证环境变量设为 0 时回退到默认值。
+
+    Args:
+        monkeypatch: pytest 环境变量 monkeypatch 工具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
+    monkeypatch.setenv(DOCLING_CHUNK_SIZE_ENV, "0")
+    assert resolve_docling_chunk_size() == _DOCLING_CHUNK_PAGE_SIZE_DEFAULT
 
 
 def test_build_docling_pdf_pipeline_options_uses_resolved_device(
@@ -831,3 +898,317 @@ def test_run_docling_pdf_conversion_on_windows_full_chain(
         ("docling-parse", "auto"),
         ("docling-parse", "cpu"),
     ]
+
+# ============================================================================
+# 分片转换与合并测试
+# ============================================================================
+
+_TEST_PAGE_COUNT = 50
+
+
+def _make_fake_docling_dict(
+    text_count: int,
+    table_count: int,
+    group_count: int,
+    page_count: int,
+) -> dict:
+    """构建模拟的 Docling export_to_dict() 结果。
+
+    Args:
+        text_count: texts 数组长度。
+        table_count: tables 数组长度。
+        group_count: groups 数组长度。
+        page_count: 模拟的页数。
+
+    Returns:
+        模拟的 Docling 文档字典。
+
+    Raises:
+        无。
+    """
+    texts = [
+        {
+            "self_ref": f"#/texts/{i}",
+            "text": f"fake text {i}",
+            "prov": [{"page_no": i % page_count, "bbox": [0, 0, 100, 20]}],
+        }
+        for i in range(text_count)
+    ]
+    tables = [
+        {
+            "self_ref": f"#/tables/{i}",
+            "prov": [{"page_no": i % page_count, "bbox": [0, 0, 200, 100]}],
+        }
+        for i in range(table_count)
+    ]
+    groups = [
+        {
+            "self_ref": f"#/groups/{i}",
+            "name": "root" if i == 0 else f"section-{i}",
+            "children": [
+                {"$ref": f"#/texts/{i}"},
+            ] if i < text_count else [],
+        }
+        for i in range(group_count)
+    ]
+    body = {
+        "self_ref": "#/groups/0",
+        "children": [{"$ref": f"#/groups/{i}"} for i in range(1, group_count)],
+    }
+    pages = {str(i): {"page_no": i, "size": {"width": 612, "height": 792}} for i in range(page_count)}
+    return {
+        "schema_name": "docling",
+        "version": "1.0.0",
+        "body": body,
+        "texts": texts,
+        "tables": tables,
+        "groups": groups,
+        "pages": pages,
+        "pictures": [],
+    }
+
+
+class TestMergeDoclingDicts:
+    """_merge_docling_dicts 单元测试。"""
+
+    def test_single_chunk_returns_unchanged(self) -> None:
+        """验证单 chunk 直接返回，不做多余处理。"""
+        from dayu.docling_runtime import _merge_docling_dicts
+
+        chunk = _make_fake_docling_dict(text_count=3, table_count=2, group_count=2, page_count=5)
+        result = _merge_docling_dicts([chunk], [0])
+        assert len(result["texts"]) == 3
+        assert len(result["tables"]) == 2
+        assert len(result["groups"]) == 2
+
+    def test_empty_list_raises(self) -> None:
+        """验证空列表抛出 ValueError。"""
+        from dayu.docling_runtime import _merge_docling_dicts
+
+        with pytest.raises(ValueError, match="chunk_dicts"):
+            _merge_docling_dicts([], [])
+
+    def test_merge_texts_across_chunks(self) -> None:
+        """验证 texts 跨 chunk 合并后总数为 sum。"""
+        from dayu.docling_runtime import _merge_docling_dicts
+
+        chunk_a = _make_fake_docling_dict(text_count=3, table_count=1, group_count=2, page_count=3)
+        chunk_b = _make_fake_docling_dict(text_count=2, table_count=1, group_count=2, page_count=2)
+        result = _merge_docling_dicts([chunk_a, chunk_b], [0, 3])
+        assert len(result["texts"]) == 5
+
+    def test_self_ref_remapping(self) -> None:
+        """验证 texts self_ref 在合并后编号正确衔接。"""
+        from dayu.docling_runtime import _merge_docling_dicts
+
+        chunk_a = _make_fake_docling_dict(text_count=3, table_count=1, group_count=2, page_count=3)
+        chunk_b = _make_fake_docling_dict(text_count=2, table_count=1, group_count=2, page_count=2)
+        result = _merge_docling_dicts([chunk_a, chunk_b], [0, 3])
+
+        # chunk_a texts: #/texts/0, #/texts/1, #/texts/2
+        # chunk_b texts: #/texts/3, #/texts/4
+        refs = [t["self_ref"] for t in result["texts"]]
+        assert refs == [
+            "#/texts/0", "#/texts/1", "#/texts/2",
+            "#/texts/3", "#/texts/4",
+        ]
+
+    def test_page_no_offset(self) -> None:
+        """验证 chunk_b 的 prov[].page_no 正确偏移。"""
+        from dayu.docling_runtime import _merge_docling_dicts
+
+        chunk_a = _make_fake_docling_dict(text_count=1, table_count=0, group_count=1, page_count=2)
+        chunk_b = _make_fake_docling_dict(text_count=1, table_count=0, group_count=1, page_count=2)
+
+        # chunk_b text on page 0 → after offset page 2
+        result = _merge_docling_dicts([chunk_a, chunk_b], [0, 2])
+        assert result["texts"][0]["prov"][0]["page_no"] == 0
+        assert result["texts"][1]["prov"][0]["page_no"] == 2
+
+    def test_pages_dict_key_offset(self) -> None:
+        """验证 pages dict 的 key 在合并后正确偏移。"""
+        from dayu.docling_runtime import _merge_docling_dicts
+
+        chunk_a = _make_fake_docling_dict(text_count=1, table_count=0, group_count=1, page_count=2)
+        chunk_b = _make_fake_docling_dict(text_count=1, table_count=0, group_count=1, page_count=2)
+        result = _merge_docling_dicts([chunk_a, chunk_b], [0, 2])
+
+        pages = result["pages"]
+        assert "0" in pages
+        assert "1" in pages
+        assert "2" in pages
+        assert "3" in pages
+
+    def test_body_children_concatenated(self) -> None:
+        """验证 body.children 跨 chunk 正确拼接。"""
+        from dayu.docling_runtime import _merge_docling_dicts
+
+        chunk_a = _make_fake_docling_dict(text_count=2, table_count=0, group_count=3, page_count=2)
+        chunk_b = _make_fake_docling_dict(text_count=0, table_count=0, group_count=2, page_count=2)
+        result = _merge_docling_dicts([chunk_a, chunk_b], [0, 2])
+
+        # chunk_a groups: 0(root), 1, 2 → body has children pointing to 1,2
+        # chunk_b groups: 0(root), 1 → body has children pointing to 1
+        # After remap: chunk_b old groups 1 → new groups 4 (index 3+1)
+        body_children = result["body"]["children"]
+        assert len(body_children) == 3  # chunk_a: 2 refs + chunk_b: 1 ref
+
+
+class TestConvertPdfBytesWithDoclingChunked:
+    """convert_pdf_bytes_with_docling 分片路径测试。"""
+
+    def test_small_pdf_uses_single_shot(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """验证 ≤ 50 页的 PDF 走原单次转换路径。"""
+        monkeypatch.setattr(
+            "dayu.docling_runtime._get_pdf_page_count",
+            lambda _raw_bytes: 3,
+        )
+        monkeypatch.setattr(
+            "dayu.docling_runtime._split_pdf_bytes",
+            lambda _raw_bytes, _n: [_raw_bytes],
+        )
+
+        stream_built: list[int] = []
+
+        def _fake_build_stream(raw_bytes: bytes, *, stream_name: str) -> object:
+            stream_built.append(1)
+            return object()
+
+        monkeypatch.setattr(
+            "dayu.docling_runtime._build_docling_document_stream",
+            _fake_build_stream,
+        )
+
+        called: list[int] = []
+
+        def _fake_run_conversion(convert_op: object, **kwargs: object) -> object:
+            called.append(1)
+            return _FakeChunkedResult(document=_FakeDocument())
+
+        monkeypatch.setattr(
+            "dayu.docling_runtime.run_docling_pdf_conversion",
+            _fake_run_conversion,
+        )
+
+        result = convert_pdf_bytes_with_docling(b"fake", stream_name="test.pdf")
+        assert len(stream_built) == 1
+        assert len(called) == 1
+        assert hasattr(result, "document")
+
+    def test_large_pdf_triggers_chunking(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """验证 > 50 页的 PDF 触发分片路径。"""
+        # 模拟 100 页 PDF 拆分为 2 个分片
+        monkeypatch.setattr(
+            "dayu.docling_runtime._get_pdf_page_count",
+            lambda _raw_bytes: 100,
+        )
+        monkeypatch.setattr(
+            "dayu.docling_runtime._split_pdf_bytes",
+            lambda _raw_bytes, _n: [b"chunk1", b"chunk2"],
+        )
+
+        conversion_count: list[int] = []
+
+        def _fake_run_conversion(convert_op: object, **kwargs: object) -> object:
+            conversion_count.append(1)
+            doc = _FakeDocument(export_dict=_make_fake_docling_dict(
+                text_count=2, table_count=1, group_count=2, page_count=50,
+            ))
+            return _FakeChunkedResult(document=doc)
+
+        monkeypatch.setattr(
+            "dayu.docling_runtime.run_docling_pdf_conversion",
+            _fake_run_conversion,
+        )
+        monkeypatch.setattr(
+            "dayu.docling_runtime._build_docling_document_stream",
+            lambda raw_bytes, *, stream_name: object(),
+        )
+        # _build_chunked_result 使用真实 DoclingDocument 校验，mock 数据无法通过校验
+        monkeypatch.setattr(
+            "dayu.docling_runtime._build_chunked_result",
+            lambda merged_dict: _FakeChunkedResult(document=_FakeDocument()),
+        )
+
+        result = convert_pdf_bytes_with_docling(b"fake", stream_name="test.pdf")
+        assert len(conversion_count) == 2  # 每个 chunk 一次转换
+        assert hasattr(result, "document")
+
+    def test_exactly_default_chunk_pages_uses_single_shot(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """验证恰好等于默认分片阈值时走单次转换路径。"""
+        monkeypatch.setattr(
+            "dayu.docling_runtime._get_pdf_page_count",
+            lambda _raw_bytes: _DOCLING_CHUNK_PAGE_SIZE_DEFAULT,
+        )
+        monkeypatch.setattr(
+            "dayu.docling_runtime._split_pdf_bytes",
+            lambda _raw_bytes, _n: [_raw_bytes],
+        )
+
+        called: list[int] = []
+
+        def _fake_run_conversion(convert_op: object, **kwargs: object) -> object:
+            called.append(1)
+            return _FakeChunkedResult(document=_FakeDocument())
+
+        monkeypatch.setattr(
+            "dayu.docling_runtime.run_docling_pdf_conversion",
+            _fake_run_conversion,
+        )
+        monkeypatch.setattr(
+            "dayu.docling_runtime._build_docling_document_stream",
+            lambda raw_bytes, *, stream_name: object(),
+        )
+
+        result = convert_pdf_bytes_with_docling(b"fake", stream_name="test.pdf")
+        assert len(called) == 1
+        assert hasattr(result, "document")
+
+    def test_page_count_error_falls_back_to_single_shot(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """验证页数统计失败时回退到单次转换。"""
+        monkeypatch.setattr(
+            "dayu.docling_runtime._get_pdf_page_count",
+            lambda _raw_bytes: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+
+        called: list[int] = []
+
+        def _fake_run_conversion(convert_op: object, **kwargs: object) -> object:
+            called.append(1)
+            return _FakeChunkedResult(document=_FakeDocument())
+
+        monkeypatch.setattr(
+            "dayu.docling_runtime.run_docling_pdf_conversion",
+            _fake_run_conversion,
+        )
+        monkeypatch.setattr(
+            "dayu.docling_runtime._build_docling_document_stream",
+            lambda raw_bytes, *, stream_name: object(),
+        )
+
+        result = convert_pdf_bytes_with_docling(b"fake", stream_name="test.pdf")
+        assert len(called) == 1
+        assert hasattr(result, "document")
+
+
+class _FakeDocument:
+    """假 DoclingDocument，携带 export_to_dict() 的返回值。"""
+
+    def __init__(self, export_dict: dict | None = None) -> None:
+        self._export_dict = export_dict or {}
+
+    def export_to_dict(self) -> dict:
+        """返回假导出字典。"""
+        return self._export_dict
+
+    def export_to_markdown(self) -> str:
+        """返回假 Markdown。"""
+        return ""
+
+
+class _FakeChunkedResult:
+    """假 ConversionResult。"""
+
+    def __init__(self, document: _FakeDocument) -> None:
+        self.document = document
+
