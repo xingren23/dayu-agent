@@ -50,7 +50,7 @@ if TYPE_CHECKING:
     from docling.datamodel.base_models import DocumentStream
     from docling.datamodel.document import ConversionResult
     from docling_core.types.doc.document import DoclingDocument
-    from docling.datamodel.pipeline_options import PipelineOptions, TableFormerMode
+    from docling.datamodel.pipeline_options import OcrOptions, PipelineOptions, TableFormerMode
     from docling.document_converter import DocumentConverter
 
 DOCLING_DEVICE_ENV = "DAYU_DOCLING_DEVICE"
@@ -112,6 +112,7 @@ class _DoclingPdfPipelineOptionsProtocol(Protocol):
     do_ocr: bool
     do_table_structure: bool
     accelerator_options: "AcceleratorOptions | None"
+    ocr_options: "OcrOptions"
     table_structure_options: _DoclingTableStructureOptionsProtocol
 
 
@@ -479,8 +480,10 @@ def build_docling_pdf_pipeline_options(
         )
         from docling.datamodel.pipeline_options import (
             PdfPipelineOptions,
+            RapidOcrOptions,
             TableFormerMode,
         )
+        from docling.utils.accelerator_utils import decide_device
     except ImportError as exc:  # pragma: no cover - 依赖缺失保护
         raise DoclingRuntimeInitializationError("Docling 未安装，无法构造 PDF pipeline 选项") from exc
 
@@ -496,6 +499,16 @@ def build_docling_pdf_pipeline_options(
     pipeline_options.accelerator_options = AcceleratorOptions(
         device=AcceleratorDevice(normalized_device_name)
     )
+
+    # CUDA 可用时使用 RapidOCR torch 后端，相比 onnxruntime 后端：
+    # 1. PyTorch 原生 CUDA 推理路径，无需 ONNX 图层开销；
+    # 2. Docling 已正确传入 EngineConfig.torch.use_cuda（无 onnxruntime 的传参路径 bug）。
+    if do_ocr:
+        resolved = decide_device(AcceleratorDevice(normalized_device_name))
+        if _CUDA_DEVICE_NAME in resolved:
+            pipeline_options.ocr_options = RapidOcrOptions(backend="torch")
+        else:
+            pipeline_options.ocr_options = RapidOcrOptions(backend="onnxruntime")
 
     if do_table_structure:
         table_structure_options = cast(
