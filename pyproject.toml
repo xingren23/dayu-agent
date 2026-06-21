@@ -75,6 +75,7 @@ web = [
 # MCP Server, 供 opencode/codex/claude-code 等工具远程调用财报能力。
 mcp = [
     "mcp>=1.20.0",
+    "uvicorn>=0.30.0,<1.0.0",
 ]
 # 测试与静态检查工具链。
 test = [

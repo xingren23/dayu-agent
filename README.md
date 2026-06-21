@@ -404,40 +404,43 @@ pip install dayu-agent[mcp]
 
 **启动**（需先通过 `dayu-cli download` / `dayu-cli process` 完成财报下载和预处理）：
 
+```bash
+export DAYU_WORKSPACE=/path/to/workspace
+dayu-mcp --host 127.0.0.1 --port 8000
+# 服务地址: http://127.0.0.1:8000/mcp
+```
+
+**从 stdio 迁移**：旧版 `dayu-mcp` 以 stdio 子进程方式运行（客户端通过 `-- dayu-mcp --workspace ...` 启动）。当前版本改为 **Streamable HTTP**：需先独立启动 `dayu-mcp` 服务，再在客户端配置 remote URL（见下文），不再把 `dayu-mcp` 作为 stdio 子进程挂载。
 
 **在 opencode 中配置**（`~/.config/opencode/opencode.json`）：
 
-opencode mcp add 将引导你完成配置（命令行）
-
-```bash
-┌  Add MCP server
-│
-◇  Location
-│  Global
-│
-◇  Enter MCP server name
-│  dayu-fins
-│
-◇  Select MCP server type
-│  Local
-│
-■  Enter command to run
-  dayu-mcp --workspace /path/to/workspace
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "dayu-fins": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8000/mcp",
+      "enabled": true
+    }
+  }
+}
 ```
+
+也可通过 `opencode mcp add` 交互式添加，选择 Remote 类型并填写上述 URL。
 
 **在 codex 中配置**（命令行）：
 
 ```bash
-codex mcp add dayu-fins \
-  --env DAYU_WORKSPACE=/path/to/workspace \
-  -- dayu-mcp --workspace /path/to/workspace
+# 先启动 dayu-mcp，再在 codex 中注册 remote URL
+codex mcp add dayu-fins --url http://127.0.0.1:8000/mcp
 ```
 
 **在 claude-code 中配置**（命令行）：
 
 ```bash
-claude mcp add --transport stdio --env DAYU_WORKSPACE=/path/to/workspace dayu-fins \
-  -- dayu-mcp --workspace /path/to/workspace
+# 先启动 dayu-mcp，再在 claude-code 中注册 remote URL
+claude mcp add --transport http dayu-fins --url http://127.0.0.1:8000/mcp
 ```
 
 **当前暴露的工具**（9 个）：
@@ -450,7 +453,9 @@ claude mcp add --transport stdio --env DAYU_WORKSPACE=/path/to/workspace dayu-fi
 | 变量 | 说明 |
 |------|------|
 | `DAYU_WORKSPACE` | 工作区根目录路径（优先级高于 `--workspace`） |
-| `DAYU_LOG_LEVEL` | 日志级别，可选 `DEBUG`/`INFO`/`WARNING`/`ERROR`（默认 `WARNING`） |
+| `DAYU_MCP_HOST` | HTTP 监听地址（默认 `127.0.0.1`，远程部署时可设为 `0.0.0.0`） |
+| `DAYU_MCP_PORT` | HTTP 监听端口（默认 `8000`） |
+| `DAYU_LOG_LEVEL` | 日志级别，可选 `DEBUG`/`INFO`/`WARNING`/`ERROR`（默认 `INFO`）；记录 HTTP 与 tools/call 请求/响应 |
 
 ## 3. 最常用工作流
 

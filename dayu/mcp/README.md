@@ -14,9 +14,9 @@ MCP 暴露面在此基础上，将**财报读取**能力以独立进程方式提
 MCP 模块不取代 dayu 内部工具路径，而是并行的另一条暴露路径：
 ```
 外部 Agent (opencode / codex / claude-code)
-  │  MCP 协议（stdio: stdin 读 JSON-RPC / stdout 写 JSON-RPC）
+  │  MCP 协议（Streamable HTTP: POST/GET http://host:port/mcp）
   ▼
-dayu/mcp/server.py          ← MCP 入口（stdio 传输 + 工具注册）
+dayu/mcp/server.py          ← MCP 入口（Streamable HTTP 传输 + 工具注册）
   │
   ▼
 dayu/mcp/fins_tools.py      ← 9 工具 schema 定义 + 调度转发
@@ -27,6 +27,8 @@ dayu.fins.service_runtime   ← DefaultFinsRuntime.create() 装配仓储/处理�
   ▼
 dayu.fins.tools.service     ← FinsToolService（财报读取 API）
 ```
+
+默认监听 `127.0.0.1:8000/mcp`。远程部署时使用 `--host 0.0.0.0` 并在网络层加反向代理或鉴权；当前版本不内置 API token / OAuth。
 
 ### 1.2 不引入的层
 
@@ -114,6 +116,18 @@ MCP 层信任此截止，不附加二次截断。如需调整，通过修改 `De
 MCP server 通过 `asyncio.to_thread()` 将每次调用包装到线程池执行，避免阻塞 asyncio 事件循环。
 `FinsToolService` 内部 `ProcessorLRUCache`（128 项）使用 `Lock` + `RLock` 保护，在线程池环境下并发安全。
 
+### 1.10 请求/响应日志
+
+`dayu-mcp` 通过 `DAYU_LOG_LEVEL`（或 `--log-level`）控制日志粒度，统一输出到 stderr：
+
+| 级别 | 记录内容 |
+|------|----------|
+| `INFO`（默认） | HTTP 请求/响应（client、method、path、status）、`tools/list` 工具列表、`tools/call` 请求参数、响应字节数/耗时/正文截断 |
+| `WARNING` | 仅工具业务/参数错误响应（含 error code） |
+| `DEBUG` | 在 INFO 基础上输出 `tools/call` 更长响应正文预览（上限 4096 字符） |
+
+默认 `INFO`；大响应正文在 INFO 已截断预览，更长正文仅在 `DEBUG` 输出且仍受 4096 字符上限约束。
+
 ## 2. 功能
 
 ### 2.1 暴露的 9 个工具
@@ -155,12 +169,13 @@ MCP server 通过 `asyncio.to_thread()` 将每次调用包装到线程池执行�
 4. 在 `dispatch_tool_call()` 的 if-else 链中添加分支
 5. 在 `tests/mcp/test_mcp.py` 中新增对应的 schema + dispatch 测试
 
-### 3.2 支持 HTTP 传输（SSE）
+### 3.2 远程部署与鉴权
 
-当前仅支持 stdio。如需远程部署或团队共享：
-1. 新增 `dayu/mcp/http_server.py` 使用 `mcp.server.sse.SseServerTransport`
-2. 在 `pyproject.toml` 中新增 `dayu-mcp-http` 入口点
-3. 考虑鉴权（API token / OAuth）
+当前 `server.py` 已通过 MCP Streamable HTTP（`stateless=True` + `json_response=True`）暴露服务，入口仍为 `dayu-mcp`。
+
+- 本地开发：`dayu-mcp --workspace /path/to/workspace --port 8000`
+- 远程监听：`dayu-mcp --host 0.0.0.0 --port 8000`，客户端连接 `http://<host>:8000/mcp`
+- 生产环境建议在反向代理后加鉴权（API token / OAuth）；当前版本未内置鉴权逻辑
 
 ### 3.3 支持 MCP Resources
 

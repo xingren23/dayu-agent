@@ -3,7 +3,7 @@
 测试策略：
 - TestToolSchemas: 验证 9 个工具的 MCP schema 结构（无外部依赖）
 - TestDispatch: 使用真实 workspace 数据验证 dispatch_tool_call（需 workspace）
-- TestEndToEnd: MCP 子进程协议兼容性冒烟测试（需 workspace）
+- TestEndToEnd: Streamable HTTP 协议兼容性冒烟测试（需 workspace 与 mcp extra）
 """
 
 from __future__ import annotations
@@ -11,15 +11,31 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
 
 import pytest
+
+pytest.importorskip("mcp.client.streamable_http")
+
+from mcp.client.session import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+from mcp.types import InitializeResult, TextContent, Tool
 
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.tools.service import FinsToolService
 from dayu.mcp.fins_tools import build_mcp_tools, dispatch_tool_call
+from dayu.mcp.server import (
+    TOOL_ARGUMENTS_LOG_MAX_CHARS,
+    TOOL_RESPONSE_DEBUG_LOG_MAX_CHARS,
+    TOOL_RESPONSE_LOG_MAX_CHARS,
+    _format_tool_arguments_for_log,
+    _summarize_tool_result_for_log,
+    _truncate_log_text,
+)
 
 # 工作区根目录；若不存在则跳过需 workspace 的测试
 _WORKSPACE_ROOT = Path(os.environ.get("DAYU_WORKSPACE", Path(__file__).resolve().parents[2] / "workspace"))
@@ -351,143 +367,226 @@ class TestDispatch:
 
 
 # ---------------------------------------------------------------------------
-# TestEndToEnd — MCP 子进程协议兼容性冒烟
+# TestEndToEnd — Streamable HTTP 协议兼容性冒烟
 # ---------------------------------------------------------------------------
+
+MCP_SERVER_STARTUP_TIMEOUT_SECONDS = 15.0
+MCP_SERVER_STARTUP_POLL_INTERVAL_SECONDS = 0.2
+
+
+def _pick_free_port() -> int:
+    """选取本机可用 TCP 端口。
+
+    Returns:
+        可用端口号。
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+async def _read_subprocess_stderr(proc: asyncio.subprocess.Process) -> str:
+    """读取子进程 stderr 文本。
+
+    Args:
+        proc: 已启动或已退出的子进程。
+
+    Returns:
+        stderr 解码后的字符串；无 stderr 管道时返回空串。
+    """
+    if proc.stderr is None:
+        return ""
+    stderr = await proc.stderr.read()
+    return stderr.decode()
+
+
+async def _wait_for_mcp_server_ready(
+    port: int,
+    proc: asyncio.subprocess.Process,
+    *,
+    timeout_seconds: float = MCP_SERVER_STARTUP_TIMEOUT_SECONDS,
+) -> None:
+    """轮询直至 dayu-mcp 可完成 MCP initialize，或子进程已退出/超时。
+
+    Args:
+        port: HTTP 监听端口。
+        proc: dayu-mcp 子进程。
+        timeout_seconds: 最长等待秒数。
+
+    Raises:
+        RuntimeError: 子进程提前退出。
+        TimeoutError: 超时仍未就绪。
+    """
+    url = f"http://127.0.0.1:{port}/mcp"
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+
+    while asyncio.get_running_loop().time() < deadline:
+        if proc.returncode is not None:
+            raise RuntimeError(
+                f"dayu-mcp 子进程启动失败，退出码={proc.returncode}: "
+                f"{await _read_subprocess_stderr(proc)}"
+            )
+        try:
+            async with streamable_http_client(url) as (
+                read_stream,
+                write_stream,
+                _get_session_id,
+            ):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+            return
+        except Exception:
+            # 端口尚未监听或 MCP 握手尚未就绪，短暂等待后重试。
+            await asyncio.sleep(MCP_SERVER_STARTUP_POLL_INTERVAL_SECONDS)
+
+    raise TimeoutError(
+        f"dayu-mcp 在 {timeout_seconds}s 内未就绪: {url}"
+    )
+
+
+@asynccontextmanager
+async def _running_mcp_server(port: int) -> AsyncIterator[asyncio.subprocess.Process]:
+    """启动 dayu-mcp 子进程并在退出时清理。
+
+    Args:
+        port: HTTP 监听端口。
+
+    Yields:
+        已启动的子进程对象。
+
+    Raises:
+        RuntimeError: 子进程启动后立即退出时抛出。
+    """
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "dayu.mcp.server",
+        "--workspace",
+        str(_WORKSPACE_ROOT),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        await _wait_for_mcp_server_ready(port, proc)
+        yield proc
+    finally:
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+
+
+@asynccontextmanager
+async def _mcp_client_session(
+    port: int,
+) -> AsyncIterator[tuple[ClientSession, InitializeResult]]:
+    """连接运行中的 dayu-mcp Streamable HTTP 服务并建立 ClientSession。
+
+    Args:
+        port: HTTP 监听端口。
+
+    Yields:
+        已完成 initialize 的 ``(ClientSession, InitializeResult)`` 元组。
+    """
+    url = f"http://127.0.0.1:{port}/mcp"
+    async with streamable_http_client(url) as (read_stream, write_stream, _get_session_id):
+        async with ClientSession(read_stream, write_stream) as session:
+            init_result = await session.initialize()
+            yield session, init_result
 
 
 class TestEndToEnd:
-    """端到端 MCP 协议兼容性测试。"""
+    """端到端 Streamable HTTP 协议兼容性测试。"""
 
     @requires_workspace
     @pytest.mark.asyncio
     async def test_initialize_and_list_tools(self) -> None:
         """启动 dayu-mcp 子进程，完成初始化握手 + 列出工具。"""
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "dayu.mcp.server",
-            "--workspace", str(_WORKSPACE_ROOT),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        port = _pick_free_port()
+        async with _running_mcp_server(port):
+            async with _mcp_client_session(port) as (session, init_result):
+                assert init_result.serverInfo.name == "dayu-fins-reader"
+                assert init_result.capabilities.tools is not None
 
-        assert proc.stdin is not None, "stdin must not be None"
-        assert proc.stdout is not None, "stdout must not be None"
-
-        try:
-            # 发送 initialize 请求
-            init_req = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "test", "version": "0.1.0"},
-                },
-            }
-            proc.stdin.write((json.dumps(init_req) + "\n").encode())
-            await proc.stdin.drain()
-
-            # 读取 initialize 响应
-            line = await asyncio.wait_for(proc.stdout.readline(), timeout=15.0)
-            response = json.loads(line.decode())
-            assert response["id"] == 1
-            assert response["result"]["serverInfo"]["name"] == "dayu-fins-reader"
-            assert response["result"]["capabilities"]["tools"] is not None
-
-            # 发送 initialized 通知
-            notif = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
-            proc.stdin.write((json.dumps(notif) + "\n").encode())
-            await proc.stdin.drain()
-
-            # 发送 tools/list
-            list_req = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
-            proc.stdin.write((json.dumps(list_req) + "\n").encode())
-            await proc.stdin.drain()
-
-            line = await asyncio.wait_for(proc.stdout.readline(), timeout=10.0)
-            list_response = json.loads(line.decode())
-            assert list_response["id"] == 2
-            tools = list_response["result"]["tools"]
-            assert len(tools) == 9
-            tool_names = [t["name"] for t in tools]
-            assert "list_documents" in tool_names
-            assert "read_section" in tool_names
-            assert "query_xbrl_facts" in tool_names
-
-        finally:
-            proc.stdin.close()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5.0)
-            except (asyncio.TimeoutError, ProcessLookupError):
-                proc.kill()
-                await proc.wait()
+                tools_result = await session.list_tools()
+                assert len(tools_result.tools) == 9
+                tool_names = [tool.name for tool in tools_result.tools]
+                assert "list_documents" in tool_names
+                assert "read_section" in tool_names
+                assert "query_xbrl_facts" in tool_names
 
     @requires_workspace
     @pytest.mark.asyncio
     async def test_call_tool_list_documents(self) -> None:
         """通过 MCP 协议调用 list_documents 工具。"""
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "dayu.mcp.server",
-            "--workspace", str(_WORKSPACE_ROOT),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        port = _pick_free_port()
+        async with _running_mcp_server(port):
+            async with _mcp_client_session(port) as (session, _init_result):
+                call_result = await session.call_tool(
+                    "list_documents",
+                    {"ticker": "NVDA"},
+                )
+                assert not call_result.isError
+                assert len(call_result.content) > 0
+                first_content = call_result.content[0]
+                assert isinstance(first_content, TextContent)
+                data = json.loads(first_content.text)
+                assert data["company"]["ticker"] == "NVDA"
+                assert data["total"] > 0
+
+
+# ---------------------------------------------------------------------------
+# TestMcpLogging — 请求/响应日志辅助函数
+# ---------------------------------------------------------------------------
+
+
+class TestMcpLogging:
+    """验证 MCP 请求/响应日志摘要辅助函数。"""
+
+    def test_truncate_log_text_appends_total_chars(self) -> None:
+        """超长文本应截断并附带总长度。"""
+        text = "x" * (TOOL_RESPONSE_LOG_MAX_CHARS + 10)
+        truncated = _truncate_log_text(text, TOOL_RESPONSE_LOG_MAX_CHARS)
+        assert truncated.endswith(f"(truncated, total_chars={len(text)})")
+        assert len(truncated) > TOOL_RESPONSE_LOG_MAX_CHARS
+
+    def test_truncate_log_text_debug_limit(self) -> None:
+        """DEBUG 级正文预览也应受上限约束。"""
+        text = "y" * (TOOL_RESPONSE_DEBUG_LOG_MAX_CHARS + 10)
+        truncated = _truncate_log_text(text, TOOL_RESPONSE_DEBUG_LOG_MAX_CHARS)
+        assert "truncated" in truncated
+        assert f"total_chars={len(text)}" in truncated
+
+    def test_format_tool_arguments_for_log_serializes_mapping(self) -> None:
+        """工具参数摘要应输出 JSON 字符串。"""
+        summary = _format_tool_arguments_for_log({"ticker": "NVDA", "page_no": 1})
+        assert '"ticker": "NVDA"' in summary
+        assert '"page_no": 1' in summary
+
+    def test_format_tool_arguments_for_log_truncates_long_payload(self) -> None:
+        """过长参数摘要应被截断。"""
+        long_query = "q" * (TOOL_ARGUMENTS_LOG_MAX_CHARS + 20)
+        summary = _format_tool_arguments_for_log({"query": long_query})
+        assert "truncated" in summary
+
+    def test_summarize_tool_result_for_log_success(self) -> None:
+        """成功结果摘要应标记 is_error=false。"""
+        assert _summarize_tool_result_for_log({"total": 3}) == "is_error=false"
+
+    def test_summarize_tool_result_for_log_error(self) -> None:
+        """错误结果摘要应包含 code 与 message。"""
+        summary = _summarize_tool_result_for_log(
+            {"error": True, "code": "NOT_FOUND", "message": "document missing"}
         )
-
-        assert proc.stdin is not None, "stdin must not be None"
-        assert proc.stdout is not None, "stdout must not be None"
-
-        try:
-            # initialize
-            init_req = {
-                "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "test", "version": "0.1.0"},
-                },
-            }
-            proc.stdin.write((json.dumps(init_req) + "\n").encode())
-            await proc.stdin.drain()
-            await asyncio.wait_for(proc.stdout.readline(), timeout=15.0)
-
-            # initialized notification
-            notif = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
-            proc.stdin.write((json.dumps(notif) + "\n").encode())
-            await proc.stdin.drain()
-
-            # tools/call
-            call_req = {
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": {
-                    "name": "list_documents",
-                    "arguments": {"ticker": "NVDA"},
-                },
-            }
-            proc.stdin.write((json.dumps(call_req) + "\n").encode())
-            await proc.stdin.drain()
-
-            line = await asyncio.wait_for(proc.stdout.readline(), timeout=30.0)
-            call_response = json.loads(line.decode())
-            assert call_response["id"] == 3
-            assert "result" in call_response
-            content = call_response["result"]["content"]
-            assert len(content) > 0
-            # 解析 JSON 结果
-            data = json.loads(content[0]["text"])
-            assert data["company"]["ticker"] == "NVDA"
-            assert data["total"] > 0
-
-        finally:
-            proc.stdin.close()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5.0)
-            except (asyncio.TimeoutError, ProcessLookupError):
-                proc.kill()
-                await proc.wait()
+        assert "is_error=true" in summary
+        assert "code=NOT_FOUND" in summary
+        assert "document missing" in summary
 
 
 # ---------------------------------------------------------------------------
@@ -495,7 +594,7 @@ class TestEndToEnd:
 # ---------------------------------------------------------------------------
 
 
-def _find_tool(name: str) -> Any:
+def _find_tool(name: str) -> Tool:
     """从 build_mcp_tools() 中按名称查找工具。
 
     Args:

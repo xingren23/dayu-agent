@@ -40,6 +40,9 @@
   - 端到端集成测试
 - `tests/architecture/`
   - 依赖边界与架构守护测试
+- `tests/mcp/`
+  - MCP schema、dispatch 与 Streamable HTTP 端到端冒烟测试
+  - `TestEndToEnd` 依赖 `pip install -e .[mcp,test]` 与本地 `workspace/portfolio/NVDA` 样本
 
 另外：
 - `tests/fixtures/` 放测试数据
@@ -68,6 +71,7 @@ pip install -r requirements.txt
 .venv/bin/pytest tests/fins -q
 .venv/bin/pytest tests/integration -q
 .venv/bin/pytest tests/architecture -q
+.venv/bin/pytest tests/mcp -q
 .venv/bin/pytest tests -q
 ```
 
