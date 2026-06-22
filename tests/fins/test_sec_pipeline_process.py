@@ -10,11 +10,13 @@ from typing import Any, cast
 
 import pytest
 
+from dayu.engine.processors.processor_registry import ProcessorRegistry
 from dayu.fins.domain.document_models import FilingCreateRequest
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.sec_pipeline import SecPipeline
 from dayu.fins.processors.registry import build_fins_processor_registry
 from tests.fins.storage_testkit import build_storage_core
+from tests.fins.test_sec_pipeline_process_filing_source import FakeSecProcessorWithXbrl
 from dayu.fins.storage.local_file_store import LocalFileStore
 
 
@@ -246,3 +248,48 @@ def test_process_filing_ci_rebuilds_snapshot_meta_on_version_skip(tmp_path: Path
     second = pipeline.process_filing("AAPL", document_id, overwrite=False, ci=True)
     assert second["status"] == "processed"
     assert snapshot_meta_file.exists()
+
+
+@pytest.mark.unit
+def test_process_filing_ci_skips_when_financials_sidecar_exists(tmp_path: Path) -> None:
+    """验证含 XBRL 文档在写入 financials.json 后二次 process 可跳过。"""
+
+    repository = build_storage_core(tmp_path)
+    document_id = "fil_xbrl_skip"
+    store = LocalFileStore(root=_portfolio_root(repository), scheme="local")
+    key = f"AAPL/filings/{document_id}/sample.html"
+    file_meta = store.put_object(key, BytesIO(b"<html><h1>Section</h1><p>Text</p></html>"))
+    _create_filing(
+        repository,
+        FilingCreateRequest(
+            ticker="AAPL",
+            document_id=document_id,
+            internal_document_id=document_id,
+            form_type="10-K",
+            primary_document="sample.html",
+            files=[file_meta],
+            meta={
+                "ingest_complete": True,
+                "document_version": "v1",
+                "source_fingerprint": "hash_v1",
+                "fiscal_year": 2024,
+                "fiscal_period": "FY",
+            },
+        ),
+    )
+    registry = ProcessorRegistry()
+    registry.register(FakeSecProcessorWithXbrl, name="sec_processor", priority=10, overwrite=True)
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        processor_registry=registry,
+    )
+
+    first = pipeline.process_filing("AAPL", document_id, overwrite=False, ci=True)
+    assert first["status"] == "processed"
+
+    processed_dir = tmp_path / "portfolio" / "AAPL" / "processed" / document_id
+    assert (processed_dir / "financials.json").exists()
+
+    second = pipeline.process_filing("AAPL", document_id, overwrite=False, ci=True)
+    assert second["status"] == "skipped"
+    assert second["reason"] == "version_matched"

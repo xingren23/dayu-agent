@@ -2,7 +2,7 @@
 setopt MONITOR  # 非交互脚本默认不启用 job 监控，显式开启以确保 ${#jobstates} 可用
 set -uo pipefail
 
-MAX_JOBS=26
+MAX_JOBS=4
 log_dir="workspace/tmp/process_logs"
 mkdir -p "$log_dir"
 

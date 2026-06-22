@@ -251,6 +251,7 @@ CN/HK download 的 source 写入顺序固定为：先通过 source 仓储创建�
 - `FinsRuntime.execute()` 与流式桥接必须先按 `command.name` / 事件流来源把 `FinsCommandPayload`、pipeline 事件联合显式收窄到对应 dataclass，再进入 namespace builder、pipeline 调用和 progress/result builder；不允许靠“各分支刚好共享字段名”穿透联合类型
 - `ProcessCommandPayload` 支持可选 `document_ids`；当调用方显式指定文档 ID 时，Runtime 必须把这组文档 ID 规范化后传给 pipeline，不能在桥接层丢失过滤语义
 - CLI `process` 命令和 ingestion job manager 一样必须把 `document_ids` 继续传到 `process_stream(...)`；允许在桥接层做去空、去重和稳定排序，但不能静默丢失文档过滤语义
+- 默认 `process` / `process_filing` / `process_material`（未传 `--overwrite`）会基于 `tool_snapshot_meta.json` 的版本字段与当前模式所需 `tool_snapshot_*.json` **存在性**判定是否跳过；`processed/{document_id}` 下允许的 sidecar/legacy 文件（如 `financials.json`、`sections.json`、`tables.json`）不会单独触发重跑
 - pipeline 对外 `download/process/upload` 事件对象的 `event_type` 必须直接使用各自的 `StrEnum` 真源；允许内部 helper/service 先产出更窄的文件级字面量事件，但必须在 pipeline 边界显式映射到 `DownloadEventType`、`ProcessEventType`、`UploadFilingEventType`、`UploadMaterialEventType`，不能再把裸字符串直接塞进公开事件对象
 - 对仍需沿用 CLI 规范化规则的 direct operation 命令，payload 里要显式保留 `infer` / `ticker_aliases` 等语义字段；`FinsRuntime` 在进入 pipeline 前会重建 namespace 并复用 `prepare_cli_args` / `validate_*`，保证 ticker、alias、公司名和 `form_type` 与 CLI 真源一致；这条链路必须支持“canonical ticker + 已归并 ticker_aliases”的二次 prepare，不得在 runtime 重放时把 alias 再解析丢失
 - CLI formatter 可以兼容当前 pipeline 直出字典结果，但要先在 formatter 边界把原始字典收敛成 `dayu.contracts.fins` 中的强类型 result dataclass，再按命令名分发到对应 `_format_*_result`；不能把 `FinsResultData` 联合或 `dict.get(...)` 宽访问继续穿透到展示逻辑深处

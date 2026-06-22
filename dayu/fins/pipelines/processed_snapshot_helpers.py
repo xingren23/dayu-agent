@@ -32,7 +32,7 @@ def match_snapshot_files(
     document_id: str,
     ci: bool,
 ) -> bool:
-    """校验快照文件集合是否与当前模式严格一致。
+    """校验当前模式所需的快照文件是否已全部存在。
 
     Args:
         repository: 文档文件对象仓储。
@@ -41,7 +41,9 @@ def match_snapshot_files(
         ci: 是否 CI 模式。
 
     Returns:
-        文件集合完全匹配时返回 `True`，否则返回 `False`。
+        目录非空、无子目录且当前模式所需快照文件均为现有文件的子集时返回
+        `True`；否则返回 `False`。允许存在 sidecar/legacy 文件（如
+        `financials.json`），不再要求与期望集合严格相等。
 
     Raises:
         OSError: 仓储读取失败时抛出。
@@ -54,8 +56,8 @@ def match_snapshot_files(
     if any(not entry.is_file for entry in entries):
         return False
     expected_files = set(build_snapshot_file_names(ci=ci))
-    existing_files = {entry.name for entry in entries}
-    return existing_files == expected_files
+    existing_files = {entry.name for entry in entries if entry.is_file}
+    return expected_files <= existing_files
 
 
 def cleanup_processed_snapshot_dir(
